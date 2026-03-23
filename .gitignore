@@ -1,0 +1,28 @@
+# ===== IDE =====
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# ===== Java / Maven =====
+**/target/
+*.class
+*.jar
+*.war
+*.ear
+
+# ===== Python =====
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+*.egg-info/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Logs =====
+*.log
+logs/
