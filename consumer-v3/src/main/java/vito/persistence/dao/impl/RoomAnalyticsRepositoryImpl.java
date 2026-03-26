@@ -45,7 +45,6 @@ public class RoomAnalyticsRepositoryImpl implements RoomAnalyticsRepository {
                 ? "metric#MESSAGE_COUNT#" + String.format("%02d", stats.getHour())
                 : "metric#MESSAGE_COUNT#ALL";
 
-        // ADD for numeric accumulators; SET for metadata
         StringBuilder updateExpr = new StringBuilder(
                 "ADD messageCount :mc, totalMessageLength :tl");
         Map<String, AttributeValue> values = new HashMap<>(Map.of(
@@ -56,7 +55,6 @@ public class RoomAnalyticsRepositoryImpl implements RoomAnalyticsRepository {
                 ":ts",  AttributeValue.builder().n(String.valueOf(stats.getTimestamp())).build()
         ));
 
-        // uniqueUsers: DynamoDB ADD on SS performs set union; skip if empty (invalid for ADD)
         if (stats.getUniqueUsers() != null && !stats.getUniqueUsers().isEmpty()) {
             updateExpr.append(", uniqueUsers :uu");
             values.put(":uu", AttributeValue.builder()
@@ -65,11 +63,23 @@ public class RoomAnalyticsRepositoryImpl implements RoomAnalyticsRepository {
 
         updateExpr.append(" SET roomId = :rid, #dt = :dt, #ts = :ts");
 
+        if (stats.getTopUsers() != null && !stats.getTopUsers().isEmpty()) {
+            updateExpr.append(", topUsers = :tu");
+            List<AttributeValue> topUserItems = stats.getTopUsers().stream()
+                    .map(u -> AttributeValue.builder().m(Map.of(
+                            "userId",       AttributeValue.builder().s(u.getUserId()).build(),
+                            "username",     AttributeValue.builder().s(u.getUsername() != null ? u.getUsername() : u.getUserId()).build(),
+                            "messageCount", AttributeValue.builder().n(String.valueOf(u.getMessageCount())).build()
+                    )).build())
+                    .collect(java.util.stream.Collectors.toList());
+            values.put(":tu", AttributeValue.builder().l(topUserItems).build());
+        }
+
         UpdateItemRequest request = UpdateItemRequest.builder()
                 .tableName(roomAnalyticsTable)
                 .key(Map.of(
-                        "PK", AttributeValue.builder().s(pk).build(),
-                        "SK", AttributeValue.builder().s(sk).build()
+                        "date_room_id", AttributeValue.builder().s(pk).build(),
+                        "metric_key",   AttributeValue.builder().s(sk).build()
                 ))
                 .updateExpression(updateExpr.toString())
                 .expressionAttributeNames(Map.of("#dt", "date", "#ts", "timestamp"))
@@ -88,7 +98,7 @@ public class RoomAnalyticsRepositoryImpl implements RoomAnalyticsRepository {
         log.debug("Getting top active rooms for limit={}, date={}", limit, date);
         ScanRequest request = ScanRequest.builder()
                 .tableName(roomAnalyticsTable)
-                .filterExpression("begins_with(PK, :date) AND SK = :sk")
+                .filterExpression("begins_with(date_room_id, :date) AND metric_key = :sk")
                 .expressionAttributeValues(Map.of(
                         ":date", AttributeValue.builder().s(date).build(),
                         ":sk",   AttributeValue.builder().s("metric#MESSAGE_COUNT#ALL").build()
@@ -96,9 +106,16 @@ public class RoomAnalyticsRepositoryImpl implements RoomAnalyticsRepository {
                 .build();
 
         try {
-            ScanResponse response = asyncClient.scan(request).get();
-            return response.items().stream()
-                    .map(DynamoDBMapper::mapToRoomStats)
+            List<RoomStats> allStats = new ArrayList<>();
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                ScanRequest pagedRequest = lastKey == null ? request :
+                        request.toBuilder().exclusiveStartKey(lastKey).build();
+                ScanResponse response = asyncClient.scan(pagedRequest).get();
+                response.items().forEach(item -> allStats.add(DynamoDBMapper.mapToRoomStats(item)));
+                lastKey = response.lastEvaluatedKey().isEmpty() ? null : response.lastEvaluatedKey();
+            } while (lastKey != null);
+            return allStats.stream()
                     .sorted(Comparator.comparing(RoomStats::getMessageCount).reversed())
                     .limit(limit)
                     .collect(Collectors.toList());
@@ -112,7 +129,7 @@ public class RoomAnalyticsRepositoryImpl implements RoomAnalyticsRepository {
         log.debug("Getting top active users for limit={}, date={}", limit, date);
         ScanRequest request = ScanRequest.builder()
                 .tableName(roomAnalyticsTable)
-                .filterExpression("begins_with(PK, :date) AND SK = :sk")
+                .filterExpression("begins_with(date_room_id, :date) AND metric_key = :sk")
                 .expressionAttributeValues(Map.of(
                         ":date", AttributeValue.builder().s(date).build(),
                         ":sk",   AttributeValue.builder().s("metric#MESSAGE_COUNT#ALL").build()
@@ -120,8 +137,16 @@ public class RoomAnalyticsRepositoryImpl implements RoomAnalyticsRepository {
                 .build();
 
         try {
-            ScanResponse response = asyncClient.scan(request).get();
-            return response.items().stream()
+            List<Map<String, AttributeValue>> allItems = new ArrayList<>();
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                ScanRequest pagedRequest = lastKey == null ? request :
+                        request.toBuilder().exclusiveStartKey(lastKey).build();
+                ScanResponse response = asyncClient.scan(pagedRequest).get();
+                allItems.addAll(response.items());
+                lastKey = response.lastEvaluatedKey().isEmpty() ? null : response.lastEvaluatedKey();
+            } while (lastKey != null);
+            return allItems.stream()
                     .flatMap(item -> DynamoDBMapper.mapToRoomStats(item).getTopUsers().stream())
                     .sorted(Comparator.comparing(TopUser::getMessageCount).reversed())
                     .distinct()

@@ -13,6 +13,7 @@ import vito.persistence.model.PersistentMessage;
 import vito.metrics.dto.UserRoomSummary;
 import vito.persistence.util.DynamoDBMapper;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -24,8 +25,9 @@ import java.util.stream.Collectors;
 @Slf4j
 public class MessageRepositoryImpl implements MessageRepository {
 
-    private static final String KEY_CONDITION_ROOM = "PK = :roomId AND SK BETWEEN :ts1 AND :ts2";
-    private static final String KEY_CONDITION_USER = "user_id = :userId AND ts BETWEEN :ts1 AND :ts2";
+    private static final String KEY_CONDITION_ROOM = "room_id = :roomId";
+    private static final String FILTER_TS_RANGE    = "#ts BETWEEN :ts1 AND :ts2";
+    private static final String KEY_CONDITION_USER = "user_id = :userId AND #ts BETWEEN :ts1 AND :ts2";
 
     private final DynamoDbAsyncClient asyncClient;
 
@@ -65,6 +67,8 @@ public class MessageRepositoryImpl implements MessageRepository {
         QueryRequest queryRequest = QueryRequest.builder()
                 .tableName(messagesTable)
                 .keyConditionExpression(KEY_CONDITION_ROOM)
+                .filterExpression(FILTER_TS_RANGE)
+                .expressionAttributeNames(Map.of("#ts", "timestamp"))
                 .expressionAttributeValues(Map.of(
                         ":roomId", AttributeValue.builder().s(roomId).build(),
                         ":ts1", AttributeValue.builder().n(String.valueOf(startTime)).build(),
@@ -73,11 +77,16 @@ public class MessageRepositoryImpl implements MessageRepository {
                 .build();
 
         try {
-            QueryResponse response = asyncClient.query(queryRequest).get();
-            return response.items()
-                    .stream()
-                    .map(DynamoDBMapper::mapToMessage)
-                    .collect(Collectors.toList());
+            List<PersistentMessage> allMessages = new ArrayList<>();
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                QueryRequest pagedRequest = lastKey == null ? queryRequest :
+                        queryRequest.toBuilder().exclusiveStartKey(lastKey).build();
+                QueryResponse response = asyncClient.query(pagedRequest).get();
+                response.items().forEach(item -> allMessages.add(DynamoDBMapper.mapToMessage(item)));
+                lastKey = response.lastEvaluatedKey().isEmpty() ? null : response.lastEvaluatedKey();
+            } while (lastKey != null);
+            return allMessages;
         } catch (Exception e) {
             throw new QueryException("Failed to get messages by room: " + e.getMessage());
         }
@@ -90,6 +99,7 @@ public class MessageRepositoryImpl implements MessageRepository {
                 .tableName(messagesTable)
                 .indexName("UserMessagesIndex")
                 .keyConditionExpression(KEY_CONDITION_USER)
+                .expressionAttributeNames(Map.of("#ts", "timestamp"))
                 .expressionAttributeValues(Map.of(
                         ":userId", AttributeValue.builder().s(userId).build(),
                         ":ts1", AttributeValue.builder().n(String.valueOf(startTime)).build(),
@@ -100,11 +110,16 @@ public class MessageRepositoryImpl implements MessageRepository {
                 .build();
 
         try {
-            QueryResponse response = asyncClient.query(request).get();
-            return response.items()
-                    .stream()
-                    .map(DynamoDBMapper::mapToMessage)
-                    .collect(Collectors.toList());
+            List<PersistentMessage> allMessages = new ArrayList<>();
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                QueryRequest pagedRequest = lastKey == null ? request :
+                        request.toBuilder().exclusiveStartKey(lastKey).build();
+                QueryResponse response = asyncClient.query(pagedRequest).get();
+                response.items().forEach(item -> allMessages.add(DynamoDBMapper.mapToMessage(item)));
+                lastKey = response.lastEvaluatedKey().isEmpty() ? null : response.lastEvaluatedKey();
+            } while (lastKey != null);
+            return allMessages;
         } catch (Exception e) {
             throw new QueryException("Failed to get user messages: " + e.getMessage());
         }
@@ -116,23 +131,31 @@ public class MessageRepositoryImpl implements MessageRepository {
         QueryRequest request = QueryRequest.builder()
                 .tableName(messagesTable)
                 .indexName("GSI2-UserRooms")
-                .keyConditionExpression("user2_pk = :userPk")
+                .keyConditionExpression("user_room_pk = :userPk")
                 .expressionAttributeValues(Map.of(
                         ":userPk", AttributeValue.builder().s(Constants.KEY_PREFIX_USER + userId).build()
                 ))
-                .projectionExpression("user2_sk")
+                .projectionExpression("user_room_sk")
                 .build();
 
         try {
-            QueryResponse response = asyncClient.query(request).get();
-            return response.items().stream()
-                    .map(item -> item.get("user2_sk").s())
-                    .collect(Collectors.toMap(
-                            sk -> sk.split("#", 3)[1],   // index 1 = roomId
-                            sk -> Long.parseLong(sk.split("#", 3)[2]),  // index 2 = timestamp
-                            Math::max
-                    ))
-                    .entrySet().stream()
+            Map<String, Long> roomToLastActivity = new HashMap<>();
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                QueryRequest pagedRequest = lastKey == null ? request :
+                        request.toBuilder().exclusiveStartKey(lastKey).build();
+                QueryResponse response = asyncClient.query(pagedRequest).get();
+                response.items().forEach(item -> {
+                    String sk = item.get("user_room_sk").s();
+                    String[] parts = sk.split("#", 3);
+                    String roomId = parts[1];
+                    long ts = Long.parseLong(parts[2]);
+                    roomToLastActivity.merge(roomId, ts, Math::max);
+                });
+                lastKey = response.lastEvaluatedKey().isEmpty() ? null : response.lastEvaluatedKey();
+            } while (lastKey != null);
+
+            return roomToLastActivity.entrySet().stream()
                     .map(e -> new UserRoomSummary(e.getKey(), e.getValue()))
                     .sorted(Comparator.comparingLong(UserRoomSummary::getLastActivity).reversed())
                     .collect(Collectors.toList());
@@ -140,4 +163,5 @@ public class MessageRepositoryImpl implements MessageRepository {
             throw new QueryException("Failed to get rooms for user: " + e.getMessage());
         }
     }
+
 }

@@ -18,6 +18,7 @@ import vito.persistence.model.PersistentMessage;
 import vito.persistence.util.DynamoDBMapper;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -74,6 +75,7 @@ public class BatchMessageWriter implements InitializingBean, DisposableBean {
         this.circuitBreakerRegistry = circuitBreakerRegistry;
     }
 
+    /** Initialises the scheduler and worker thread pool, then starts periodic flush tasks. */
     @Override
     public void afterPropertiesSet() {
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -103,9 +105,12 @@ public class BatchMessageWriter implements InitializingBean, DisposableBean {
 
         log.debug("Flushing {} messages to DynamoDB", drained);
 
-        List<PersistentMessage> persistentMsgs = batch.stream()
-                .map(QueueMessageConverter::toPersistentMessage)
-                .collect(Collectors.toList());
+        Map<String, PersistentMessage> dedupMap = new LinkedHashMap<>();
+        for (QueueMessage qm : batch) {
+            PersistentMessage pm = QueueMessageConverter.toPersistentMessage(qm);
+            dedupMap.put(pm.getMessageId(), pm);
+        }
+        List<PersistentMessage> persistentMsgs = new ArrayList<>(dedupMap.values());
 
         partition(persistentMsgs, DYNAMO_BATCH_LIMIT)
                 .forEach(chunk -> writeBatch(chunk, 0));
@@ -122,13 +127,12 @@ public class BatchMessageWriter implements InitializingBean, DisposableBean {
         long startNs = System.nanoTime();
         messageRepository.batchSaveMessages(chunk)
                 .thenAccept(response -> {
+                    circuitBreaker.onSuccess(System.nanoTime() - startNs, TimeUnit.NANOSECONDS);
                     List<PersistentMessage> unprocessed = extractUnprocessed(response);
                     if (!unprocessed.isEmpty()) {
-                        circuitBreaker.onError(System.nanoTime() - startNs, TimeUnit.NANOSECONDS,
-                                new RuntimeException("unprocessed items: " + unprocessed.size()));
+                        log.warn("DynamoDB returned {} unprocessed items, retrying", unprocessed.size());
                         retryOrDlq(unprocessed, attempt, "unprocessed");
                     } else {
-                        circuitBreaker.onSuccess(System.nanoTime() - startNs, TimeUnit.NANOSECONDS);
                         consumerMetrics.recordDbWriteSuccess(chunk.size());
                         log.debug("Batch of {} written successfully", chunk.size());
                     }
@@ -164,6 +168,7 @@ public class BatchMessageWriter implements InitializingBean, DisposableBean {
                 .collect(Collectors.toList());
     }
 
+    /** Performs a final flush and shuts down the scheduler and executor on bean destruction. */
     @Override
     public void destroy() throws Exception {
         log.info("BatchMessageWriter shutting down — performing final flush");

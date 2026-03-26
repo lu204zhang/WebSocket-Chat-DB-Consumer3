@@ -22,7 +22,7 @@ import java.util.stream.Collectors;
 @Slf4j
 public class UserActivityRepositoryImpl implements UserActivityRepository {
 
-    private static final String FILTER_EXPRESSION_TIME = "timestamp BETWEEN :ts1 AND :ts2";
+    private static final String FILTER_EXPRESSION_TIME = "#ts BETWEEN :ts1 AND :ts2";
 
     private final DynamoDbAsyncClient asyncClient;
 
@@ -68,6 +68,7 @@ public class UserActivityRepositoryImpl implements UserActivityRepository {
         ScanRequest request = ScanRequest.builder()
                 .tableName(userActivityTable)
                 .filterExpression(FILTER_EXPRESSION_TIME)
+                .expressionAttributeNames(Map.of("#ts", "timestamp"))
                 .expressionAttributeValues(Map.of(
                         ":ts1", AttributeValue.builder().n(String.valueOf(startTime)).build(),
                         ":ts2", AttributeValue.builder().n(String.valueOf(endTime)).build()
@@ -76,10 +77,16 @@ public class UserActivityRepositoryImpl implements UserActivityRepository {
                 .build();
 
         try {
-            ScanResponse response = asyncClient.scan(request).get();
-            return response.items().stream()
-                    .map(item -> item.get("user_id").s())
-                    .collect(Collectors.toSet());
+            Set<String> result = new java.util.HashSet<>();
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                ScanRequest pagedRequest = lastKey == null ? request :
+                        request.toBuilder().exclusiveStartKey(lastKey).build();
+                ScanResponse response = asyncClient.scan(pagedRequest).get();
+                response.items().forEach(item -> result.add(item.get("user_id").s()));
+                lastKey = response.lastEvaluatedKey().isEmpty() ? null : response.lastEvaluatedKey();
+            } while (lastKey != null);
+            return result;
         } catch (Exception e) {
             throw new QueryException("Failed to get active users: " + e.getMessage());
         }

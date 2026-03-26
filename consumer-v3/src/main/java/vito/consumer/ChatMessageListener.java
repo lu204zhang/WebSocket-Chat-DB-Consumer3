@@ -90,40 +90,21 @@ public class ChatMessageListener implements ChannelAwareMessageListener {
             return;
         }
 
-        String roomId = queueMessage.getRoomId();
-        if (roomSessionManager.getSessions(roomId).isEmpty()) {
-            channel.basicAck(deliveryTag, false);
-            return;
+        channel.basicAck(deliveryTag, false);
+        deduplicator.markProcessed(messageId);
+        retryTracker.remove(messageId);
+        consumerMetrics.recordProcessed();
+
+        boolean offeredMsg   = writeBehindQueue.offerMessage(queueMessage);
+        boolean offeredStats = writeBehindQueue.offerStats(queueMessage);
+        if (!offeredMsg || !offeredStats) {
+            log.warn("WriteBehindQueue full, skipping persistence for messageId={}", messageId);
+            consumerMetrics.recordWriteBehindDropped();
         }
 
-        boolean success = roomBroadcaster.broadcast(roomId, queueMessage);
-
-        if (!success) {
-            consumerMetrics.recordFailed();
-            int newCount = retryTracker.incrementAndGet(messageId);
-            if (newCount < retryTracker.getMaxRetries()) {
-                log.warn("Broadcast failed for message {}, retry {}/{}", messageId, newCount,
-                        retryTracker.getMaxRetries());
-                channel.basicNack(deliveryTag, false, true);
-            } else {
-                log.error("Message {} exceeded max retries ({}), nack without requeue", messageId,
-                        retryTracker.getMaxRetries());
-                channel.basicNack(deliveryTag, false, false);
-                retryTracker.remove(messageId);
-            }
-        } else {
-            channel.basicAck(deliveryTag, false);
-            retryTracker.remove(messageId);
-            deduplicator.markProcessed(messageId);
-            consumerMetrics.recordProcessed();
-
-            // Write-behind: offer to persistence queues (non-blocking, best-effort)
-            boolean offeredMsg   = writeBehindQueue.offerMessage(queueMessage);
-            boolean offeredStats = writeBehindQueue.offerStats(queueMessage);
-            if (!offeredMsg || !offeredStats) {
-                log.warn("WriteBehindQueue full, skipping persistence for messageId={}", messageId);
-                consumerMetrics.recordWriteBehindDropped();
-            }
+        String roomId = queueMessage.getRoomId();
+        if (!roomSessionManager.getSessions(roomId).isEmpty()) {
+            roomBroadcaster.broadcast(roomId, queueMessage);
         }
     }
 }

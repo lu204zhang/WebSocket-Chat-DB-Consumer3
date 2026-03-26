@@ -60,10 +60,12 @@ public class WriteBehindQueue {
         return statsQueue.drainTo(buffer, maxElements);
     }
 
+    /** @return current number of messages in the DB-write queue */
     public int getMessageQueueSize() {
         return messageQueue.size();
     }
 
+    /** @return current number of messages in the stats queue */
     public int getStatsQueueSize() {
         return statsQueue.size();
     }

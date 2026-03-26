@@ -25,7 +25,7 @@ import boto3
 from botocore.exceptions import ClientError, EndpointConnectionError
 
 # Configuration
-ENDPOINT_URL = os.environ.get('DYNAMODB_ENDPOINT', 'http://localhost:8000')
+ENDPOINT_URL = os.environ.get('DYNAMODB_ENDPOINT')
 REGION = os.environ.get('AWS_REGION', 'us-east-1')
 DRY_RUN = os.environ.get('DRY_RUN', 'False').lower() == 'true'
 
@@ -35,32 +35,32 @@ TABLE_DEFINITIONS = {
     'ChatMessages': {
         'TableName': 'ChatMessages',
         'KeySchema': [
-            {'AttributeName': 'PK', 'KeyType': 'HASH'},      # Partition Key: roomId
-            {'AttributeName': 'SK', 'KeyType': 'RANGE'},     # Sort Key: timestamp (N)
+            {'AttributeName': 'room_id',   'KeyType': 'HASH'},   # Partition Key: roomId
+            {'AttributeName': 'messageId', 'KeyType': 'RANGE'},  # Sort Key: globally unique messageId
         ],
         'AttributeDefinitions': [
-            {'AttributeName': 'PK',       'AttributeType': 'S'},
-            {'AttributeName': 'SK',       'AttributeType': 'N'},  # timestamp millis
-            {'AttributeName': 'user_id',  'AttributeType': 'S'},  # GSI1 PK
-            {'AttributeName': 'ts',       'AttributeType': 'N'},  # GSI1 SK (timestamp millis)
-            {'AttributeName': 'user2_pk', 'AttributeType': 'S'},  # GSI2 PK
-            {'AttributeName': 'user2_sk', 'AttributeType': 'S'},  # GSI2 SK
+            {'AttributeName': 'room_id',      'AttributeType': 'S'},
+            {'AttributeName': 'messageId',    'AttributeType': 'S'},  # table SK; globally unique per message
+            {'AttributeName': 'timestamp',    'AttributeType': 'N'},  # epoch millis; GSI1 SK only
+            {'AttributeName': 'user_id',      'AttributeType': 'S'},  # GSI1 PK
+            {'AttributeName': 'user_room_pk', 'AttributeType': 'S'},  # GSI2 PK
+            {'AttributeName': 'user_room_sk', 'AttributeType': 'S'},  # GSI2 SK
         ],
         'BillingMode': 'PAY_PER_REQUEST',  # On-demand pricing
         'GlobalSecondaryIndexes': [
             {
                 'IndexName': 'UserMessagesIndex',
                 'KeySchema': [
-                    {'AttributeName': 'user_id', 'KeyType': 'HASH'},
-                    {'AttributeName': 'ts',      'KeyType': 'RANGE'},
+                    {'AttributeName': 'user_id',   'KeyType': 'HASH'},
+                    {'AttributeName': 'timestamp', 'KeyType': 'RANGE'},
                 ],
                 'Projection': {'ProjectionType': 'ALL'},
             },
             {
                 'IndexName': 'GSI2-UserRooms',
                 'KeySchema': [
-                    {'AttributeName': 'user2_pk', 'KeyType': 'HASH'},
-                    {'AttributeName': 'user2_sk', 'KeyType': 'RANGE'},
+                    {'AttributeName': 'user_room_pk', 'KeyType': 'HASH'},
+                    {'AttributeName': 'user_room_sk', 'KeyType': 'RANGE'},
                 ],
                 'Projection': {'ProjectionType': 'KEYS_ONLY'},
             },
@@ -95,12 +95,12 @@ TABLE_DEFINITIONS = {
     'RoomAnalytics': {
         'TableName': 'RoomAnalytics',
         'KeySchema': [
-            {'AttributeName': 'PK', 'KeyType': 'HASH'},   # {date}#{roomId}
-            {'AttributeName': 'SK', 'KeyType': 'RANGE'},  # metric#MESSAGE_COUNT#{hour|ALL}
+            {'AttributeName': 'date_room_id', 'KeyType': 'HASH'},   # {date}#{roomId}
+            {'AttributeName': 'metric_key',   'KeyType': 'RANGE'},  # metric#MESSAGE_COUNT#{hour|ALL}
         ],
         'AttributeDefinitions': [
-            {'AttributeName': 'PK', 'AttributeType': 'S'},
-            {'AttributeName': 'SK', 'AttributeType': 'S'},
+            {'AttributeName': 'date_room_id', 'AttributeType': 'S'},
+            {'AttributeName': 'metric_key',   'AttributeType': 'S'},
         ],
         'BillingMode': 'PAY_PER_REQUEST',
         'Tags': [
@@ -130,8 +130,8 @@ def create_dynamodb_client():
             'dynamodb',
             endpoint_url=ENDPOINT_URL,
             region_name=REGION,
-            aws_access_key_id='test',  # For local development
-            aws_secret_access_key='test',  # For local development
+            # aws_access_key_id='test',  # For local development
+            # aws_secret_access_key='test',  # For local development
         )
         return client
     except Exception as e:

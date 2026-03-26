@@ -26,6 +26,11 @@ public class DynamoDBConfig {
     @Value("${aws.dynamodb.secret-key}")
     private String secretKey;
 
+    /**
+     * Creates and configures the DynamoDB async client bean.
+     * Supports optional endpoint override for local development and static credential injection.
+     * @return configured {@link DynamoDbAsyncClient}
+     */
     @Bean
     public DynamoDbAsyncClient dynamoDbAsyncClient() {
         DynamoDbAsyncClientBuilder builder = DynamoDbAsyncClient.builder().region(Region.of(region));

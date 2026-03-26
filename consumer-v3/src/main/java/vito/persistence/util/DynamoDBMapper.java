@@ -20,15 +20,12 @@ public class DynamoDBMapper {
     public static Map<String, AttributeValue> messageToItem(PersistentMessage msg) {
         Map<String, AttributeValue> item = new HashMap<>();
 
-        item.put("PK", s(msg.getRoomId()));
-        item.put("SK", n(msg.getTimestamp()));
+        item.put("room_id", s(msg.getRoomId()));
 
         item.put("user_id", s(msg.getUserId()));
-        item.put("ts", n(msg.getTimestamp()));
 
-        // GSI2: user2_pk (PK) + user2_sk (SK) for Query 4 (user room list)
-        item.put("user2_pk", s(Constants.KEY_PREFIX_USER + msg.getUserId()));
-        item.put("user2_sk", s(Constants.KEY_PREFIX_ROOM + msg.getRoomId() + "#"
+        item.put("user_room_pk", s(Constants.KEY_PREFIX_USER + msg.getUserId()));
+        item.put("user_room_sk", s(Constants.KEY_PREFIX_ROOM + msg.getRoomId() + "#"
                 + String.format("%0" + Constants.TIMESTAMP_PAD_WIDTH + "d", msg.getTimestamp())));
 
         item.put("messageId", s(msg.getMessageId()));
@@ -106,8 +103,7 @@ public class DynamoDBMapper {
             stats.setTopUsers(new ArrayList<>());
         }
 
-        // parse hour from SK: "metric#MESSAGE_COUNT#ALL" → -1, "metric#MESSAGE_COUNT#14" → 14
-        String sk = getString(item, "SK");
+        String sk = getString(item, "metric_key");
         if (sk != null && sk.startsWith(Constants.ANALYTICS_SK_PREFIX)) {
             String hourStr = sk.substring(Constants.ANALYTICS_SK_PREFIX.length());
             stats.setHour(Constants.ANALYTICS_SK_ALL.equals(hourStr) ? -1 : Integer.parseInt(hourStr));

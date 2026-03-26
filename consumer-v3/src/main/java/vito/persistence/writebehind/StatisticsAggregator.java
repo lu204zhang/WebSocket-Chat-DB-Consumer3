@@ -50,6 +50,11 @@ public class StatisticsAggregator implements InitializingBean, DisposableBean {
 
     private final AtomicInteger threadCounter = new AtomicInteger(0);
 
+    /** Global accumulated per-user message counts across all flush cycles: roomId -> userId -> TopUser.
+     *  Persists for the lifetime of the consumer; never reset between batches. */
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, TopUser>> globalUserCounts =
+            new ConcurrentHashMap<>();
+
     /**
      * @param writeBehindQueue           source queue drained on each flush cycle
      * @param userActivityRepository     DynamoDB async client for UserActivity
@@ -69,6 +74,7 @@ public class StatisticsAggregator implements InitializingBean, DisposableBean {
         this.circuitBreakerRegistry  = circuitBreakerRegistry;
     }
 
+    /** Initialises the stats scheduler and worker thread pool, then starts periodic flush tasks. */
     @Override
     public void afterPropertiesSet() {
         statsScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -99,10 +105,7 @@ public class StatisticsAggregator implements InitializingBean, DisposableBean {
 
         log.debug("StatisticsAggregator processing {} messages", drained);
 
-        // 1. UserActivity — batch writes (25 items per BatchWriteItem call) with retry
         partition(batch, Constants.DYNAMO_BATCH_LIMIT).forEach(chunk -> writeActivityBatch(chunk, 0));
-
-        // 2. RoomAnalytics — aggregate in-memory, then write one item per room with retry
         updateRoomAnalytics(batch);
     }
 
@@ -115,13 +118,11 @@ public class StatisticsAggregator implements InitializingBean, DisposableBean {
         long startNs = System.nanoTime();
         userActivityRepository.batchSaveActivities(chunk)
                 .thenAccept(response -> {
+                    circuitBreaker.onSuccess(System.nanoTime() - startNs, TimeUnit.NANOSECONDS);
                     List<QueueMessage> unprocessed = extractUnprocessedActivities(response);
                     if (!unprocessed.isEmpty()) {
-                        circuitBreaker.onError(System.nanoTime() - startNs, TimeUnit.NANOSECONDS,
-                                new RuntimeException("unprocessed activities: " + unprocessed.size()));
+                        log.warn("DynamoDB returned {} unprocessed activities, retrying", unprocessed.size());
                         retryActivityOrLog(unprocessed, attempt);
-                    } else {
-                        circuitBreaker.onSuccess(System.nanoTime() - startNs, TimeUnit.NANOSECONDS);
                     }
                 })
                 .exceptionally(ex -> {
@@ -168,8 +169,6 @@ public class StatisticsAggregator implements InitializingBean, DisposableBean {
         String today = LocalDate.now().toString();
 
         Map<String, RoomStats> aggregated = new LinkedHashMap<>();
-        // roomId -> (userId -> TopUser) for per-user message count tracking
-        Map<String, Map<String, TopUser>> userCountsByRoom = new HashMap<>();
 
         for (QueueMessage msg : batch) {
             String roomId = msg.getRoomId();
@@ -187,26 +186,30 @@ public class StatisticsAggregator implements InitializingBean, DisposableBean {
             stats.setMessageCount(stats.getMessageCount() + 1);
             stats.getUniqueUsers().add(msg.getUserId());
 
-            // Accumulate total message length (avgMessageLength computed on read)
             int msgLen = msg.getMessage() != null ? msg.getMessage().length() : 0;
             stats.setTotalMessageLength(stats.getTotalMessageLength() + msgLen);
 
-            // Track per-user message count for TopUser aggregation
-            Map<String, TopUser> userCounts = userCountsByRoom.computeIfAbsent(roomId, k -> new LinkedHashMap<>());
-            TopUser topUser = userCounts.computeIfAbsent(msg.getUserId(), uid -> {
-                TopUser u = new TopUser();
-                u.setUserId(uid);
-                u.setUsername(msg.getUsername() != null ? msg.getUsername() : uid);
-                return u;
-            });
-            topUser.setMessageCount(topUser.getMessageCount() + 1);
+            final String username = msg.getUsername() != null ? msg.getUsername() : msg.getUserId();
+            globalUserCounts
+                    .computeIfAbsent(roomId, k -> new ConcurrentHashMap<>())
+                    .compute(msg.getUserId(), (uid, existing) -> {
+                        if (existing == null) {
+                            TopUser u = new TopUser();
+                            u.setUserId(uid);
+                            u.setUsername(username);
+                            u.setMessageCount(1);
+                            return u;
+                        }
+                        existing.setMessageCount(existing.getMessageCount() + 1);
+                        return existing;
+                    });
         }
 
-        // Attach sorted top-N users to each room's stats
-        userCountsByRoom.forEach((roomId, userCounts) -> {
+        aggregated.keySet().forEach(roomId -> {
+            ConcurrentHashMap<String, TopUser> userCounts = globalUserCounts.get(roomId);
             RoomStats stats = aggregated.get(roomId);
-            if (stats != null) {
-                List<TopUser> topUsers = userCounts.values().stream()
+            if (stats != null && userCounts != null) {
+                List<TopUser> topUsers = new ArrayList<>(userCounts.values()).stream()
                         .sorted(Comparator.comparingInt(TopUser::getMessageCount).reversed())
                         .limit(TOP_USERS_LIMIT)
                         .collect(Collectors.toList());
@@ -245,6 +248,7 @@ public class StatisticsAggregator implements InitializingBean, DisposableBean {
         }
     }
 
+    /** Performs a final stats flush and shuts down the scheduler and executor on bean destruction. */
     @Override
     public void destroy() throws Exception {
         log.info("StatisticsAggregator shutting down — performing final flush");
